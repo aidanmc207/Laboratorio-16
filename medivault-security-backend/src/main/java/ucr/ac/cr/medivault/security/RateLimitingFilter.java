@@ -2,7 +2,6 @@ package ucr.ac.cr.medivault.security;
 
 import io.github.bucket4j.Bandwidth;
 import io.github.bucket4j.Bucket;
-import io.github.bucket4j.Refill;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -14,29 +13,34 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Filtro de Rate Limiting (algoritmo Token Bucket con Bucket4j).
+ * Filtro de Rate Limiting granular por direccion IP (Token Bucket con Bucket4j).
  *
- * PENDIENTE (Parte 3 - Requerimiento A): reemplazar los buckets globales
- * por un ConcurrentHashMap de buckets por direccion IP del cliente
- * (X-Forwarded-For o request.getRemoteAddr()), con un limite de
- * 5 intentos de login por minuto por IP.
+ * Cada IP de cliente obtiene su propio bucket:
+ *  - Login:       5 intentos por minuto por IP (el 6.o recibe HTTP 429).
+ *  - Expedientes: 30 peticiones por minuto por IP.
  */
 @Component
 public class RateLimitingFilter extends OncePerRequestFilter {
 
-    // Login: 10 peticiones por minuto
-    private final Bucket authBucket = Bucket.builder()
-            .addLimit(Bandwidth.classic(10,
-                    Refill.intervally(10, Duration.ofMinutes(1))))
-            .build();
+    static final int LOGIN_LIMIT_PER_MINUTE = 5;
+    static final int API_LIMIT_PER_MINUTE = 30;
 
-    // Expedientes: 30 peticiones por minuto
-    private final Bucket apiBucket = Bucket.builder()
-            .addLimit(Bandwidth.classic(30,
-                    Refill.intervally(30, Duration.ofMinutes(1))))
-            .build();
+    private static final String LOGIN_PATH = "/api/v1/auth/login";
+    private static final String API_PATH = "/api/v1/expedientes";
+
+    // Un bucket independiente por IP para cada grupo de endpoints
+    private final Map<String, Bucket> loginBuckets = new ConcurrentHashMap<>();
+    private final Map<String, Bucket> apiBuckets = new ConcurrentHashMap<>();
+
+    private final ClientIpResolver ipResolver;
+
+    public RateLimitingFilter(ClientIpResolver ipResolver) {
+        this.ipResolver = ipResolver;
+    }
 
     @Override
     protected void doFilterInternal(HttpServletRequest request,
@@ -47,10 +51,14 @@ public class RateLimitingFilter extends OncePerRequestFilter {
         String path = request.getRequestURI();
         Bucket target = null;
 
-        if (path.startsWith("/api/v1/auth/login")) {
-            target = authBucket;
-        } else if (path.startsWith("/api/v1/expedientes")) {
-            target = apiBucket;
+        if (path.startsWith(LOGIN_PATH)) {
+            String ip = ipResolver.resolve(request);
+            target = loginBuckets.computeIfAbsent(ip,
+                    k -> newBucket(LOGIN_LIMIT_PER_MINUTE));
+        } else if (path.startsWith(API_PATH)) {
+            String ip = ipResolver.resolve(request);
+            target = apiBuckets.computeIfAbsent(ip,
+                    k -> newBucket(API_LIMIT_PER_MINUTE));
         }
 
         if (target == null || target.tryConsume(1)) {
@@ -80,5 +88,14 @@ public class RateLimitingFilter extends OncePerRequestFilter {
         );
 
         response.getWriter().write(json);
+    }
+
+    private static Bucket newBucket(int capacityPerMinute) {
+        return Bucket.builder()
+                .addLimit(Bandwidth.builder()
+                        .capacity(capacityPerMinute)
+                        .refillIntervally(capacityPerMinute, Duration.ofMinutes(1))
+                        .build())
+                .build();
     }
 }

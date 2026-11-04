@@ -1,5 +1,6 @@
 package ucr.ac.cr.medivault.exception;
 
+import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -7,6 +8,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.security.authentication.BadCredentialsException;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.validation.FieldError;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
@@ -15,6 +18,8 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
+import ucr.ac.cr.medivault.business.SecurityAuditorService;
+import ucr.ac.cr.medivault.security.ClientIpResolver;
 
 import java.net.URI;
 import java.util.HashMap;
@@ -31,8 +36,27 @@ public class GlobalSecurityExceptionHandler {
     private static final Logger log = LoggerFactory.getLogger(GlobalSecurityExceptionHandler.class);
     private static final String BASE = "https://medivault.ucr.ac.cr/";
 
+    private final SecurityAuditorService auditor;
+    private final ClientIpResolver ipResolver;
+
+    public GlobalSecurityExceptionHandler(SecurityAuditorService auditor,
+                                          ClientIpResolver ipResolver) {
+        this.auditor = auditor;
+        this.ipResolver = ipResolver;
+    }
+
     @ExceptionHandler(AccessDeniedSecurityException.class)
-    public ProblemDetail handleAccessDenied(AccessDeniedSecurityException ex) {
+    public ProblemDetail handleAccessDenied(AccessDeniedSecurityException ex,
+                                            HttpServletRequest request) {
+        // Auditoria: cada intento IDOR/BOLA bloqueado queda registrado
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        String username = auth != null ? auth.getName() : null;
+        auditor.registrarIntentoIdor(
+                username,
+                ipResolver.resolve(request),
+                request.getMethod() + " " + request.getRequestURI(),
+                ex.getMessage());
+
         return problem(HttpStatus.FORBIDDEN, ex.getMessage(),
                 "Acceso Prohibido (IDOR / BOLA)", "forbidden");
     }

@@ -31,6 +31,8 @@ spring:
 # Parametros de seguridad JWT
 medivault:
   security:
+    # Confiar en X-Forwarded-For (solo detras de un proxy inverso de confianza)
+    trust-forwarded-header: true
     jwt:
       # Clave secreta HMAC-SHA256 (32+ chars)
       secret: "v9y$B&E)H@McQfTjWnZr4u7x!A%D*G-KaPdSgUkXp2s5v8y/B?E(H+MbQeThWmYq"
