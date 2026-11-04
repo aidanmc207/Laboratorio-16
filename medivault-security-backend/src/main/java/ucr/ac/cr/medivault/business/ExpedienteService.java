@@ -80,6 +80,36 @@ public class ExpedienteService {
     }
 
     /**
+     * Parte 2 - Solucion refactorizada y segura del endpoint de notas.
+     * Exige usuario autenticado, rol ROLE_DOCTOR y que sea el medico asignado.
+     */
+    @Transactional
+    public void actualizarNotasDefensivo(Long expedienteId,
+                                         String nuevasNotas,
+                                         String currentDoctorUsername) {
+        ExpedienteMedico exp = expRepo.findByIdWithDetails(expedienteId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Expediente no encontrado"));
+
+        Usuario doc = userRepo.findByUsername(currentDoctorUsername)
+                .orElseThrow(() -> new AccessDeniedSecurityException(
+                        "Doctor no valido"));
+
+        if (doc.getRol() != Rol.ROLE_DOCTOR
+                || !exp.getMedicoAsignado().getId().equals(doc.getId())) {
+            throw new AccessDeniedSecurityException(
+                    "Solo el medico asignado puede actualizar las notas.");
+        }
+
+        if (nuevasNotas == null || nuevasNotas.trim().length() < 10) {
+            throw new IllegalArgumentException("Notas: minimo 10 caracteres.");
+        }
+
+        exp.setNotasClinicas(nuevasNotas.trim());
+        expRepo.save(exp);
+    }
+
+    /**
      * Regla Defensiva de Control de Acceso (Ownership Verification).
      * Politica "deny by default": cualquier rol no contemplado es rechazado.
      */

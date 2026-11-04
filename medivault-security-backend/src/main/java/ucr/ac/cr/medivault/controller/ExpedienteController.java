@@ -6,12 +6,14 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import ucr.ac.cr.medivault.business.ExpedienteService;
+import ucr.ac.cr.medivault.controller.dto.ActualizarNotasRequestDto;
 import ucr.ac.cr.medivault.controller.dto.ExpedienteRequestDto;
 import ucr.ac.cr.medivault.controller.dto.ExpedienteResponseDto;
 
@@ -45,5 +47,19 @@ public class ExpedienteController {
             Authentication auth) {
         ExpedienteResponseDto creado = expService.registrarExpediente(req, auth.getName());
         return ResponseEntity.status(HttpStatus.CREATED).body(creado);
+    }
+
+    /**
+     * Parte 2 - Version segura del endpoint de actualizacion de notas.
+     * Recibe Authentication, valida la entrada con un DTO y delega en el
+     * servicio la verificacion de rol y de medico asignado.
+     */
+    @PatchMapping("/{id}/notas")
+    @PreAuthorize("hasAuthority('ROLE_DOCTOR')")
+    public ResponseEntity<Void> actualizarNotas(@PathVariable Long id,
+                                                @Valid @RequestBody ActualizarNotasRequestDto req,
+                                                Authentication auth) {
+        expService.actualizarNotasDefensivo(id, req.notasClinicas(), auth.getName());
+        return ResponseEntity.noContent().build();
     }
 }
