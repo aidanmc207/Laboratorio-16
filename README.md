@@ -11,8 +11,8 @@ Hardening defensivo y mitigación de vulnerabilidades OWASP en una API REST con 
 | Parte 1 – Pasos 1 a 9 (pom, configuración, entidades, JWT, SecurityConfig, Rate Limiting, DTOs, RFC 7807, servicios, controladores) | ✅ Completo |
 | Parte 1 – Paso 10 (pruebas de seguridad) | ✅ Automatizadas en `SecurityIntegrationTest` |
 | Parte 2 – Depuración del endpoint `PATCH /{id}/notas` | ✅ Versión segura implementada |
-| Parte 3 – Requerimiento A: Rate Limiting por IP | ⏳ Pendiente |
-| Parte 3 – Requerimiento B: Auditoría en `AUDIT_LOGS` (`SecurityAuditorService`) | ⏳ Pendiente |
+| Parte 3 – Requerimiento A: Rate Limiting por IP | ✅ Completo |
+| Parte 3 – Requerimiento B: Auditoría en `AUDIT_LOGS` (`SecurityAuditorService`) | ✅ Completo |
 
 ## Estructura
 
@@ -21,11 +21,13 @@ medivault-security-backend/
 ├── pom.xml
 └── src/
     ├── main/java/ucr/ac/cr/medivault/
-    │   ├── domain/        Usuario, Rol, ExpedienteMedico
-    │   ├── data/          UsuarioRepository, ExpedienteMedicoRepository
-    │   ├── business/      AuthService, ExpedienteService
-    │   ├── controller/    AuthController, ExpedienteController, dto/
-    │   ├── security/      SecurityConfig, JwtTokenProvider, JwtAuthenticationFilter, RateLimitingFilter
+    │   ├── config/        AsyncConfig (pool de hilos de auditoría)
+    │   ├── domain/        Usuario, Rol, ExpedienteMedico, AuditLog
+    │   ├── data/          UsuarioRepository, ExpedienteMedicoRepository, AuditLogRepository
+    │   ├── business/      AuthService, ExpedienteService, SecurityAuditorService
+    │   ├── controller/    AuthController, ExpedienteController, AuditoriaController, dto/
+    │   ├── security/      SecurityConfig, JwtTokenProvider, JwtAuthenticationFilter,
+    │   │                  RateLimitingFilter, ClientIpResolver
     │   ├── exception/     AccessDeniedSecurityException, ResourceNotFoundException, GlobalSecurityExceptionHandler
     │   └── MedivaultApplication.java
     ├── main/resources/    application.yml, schema.sql, data.sql
@@ -49,11 +51,12 @@ Usuarios de prueba (contraseña `Password123!`): `admin_root`, `doctor_smith`, `
 
 | Método | Ruta | Acceso |
 |---|---|---|
-| POST | `/api/v1/auth/login` | Público (10 req/min) |
+| POST | `/api/v1/auth/login` | Público (5 intentos/min por IP) |
 | GET | `/api/v1/expedientes/{id}` | Autenticado + verificación de propiedad |
 | GET | `/api/v1/expedientes/mis-expedientes` | Autenticado |
 | POST | `/api/v1/expedientes` | `ROLE_DOCTOR` / `ROLE_ADMIN` |
 | PATCH | `/api/v1/expedientes/{id}/notas` | Solo el médico asignado (Parte 2) |
+| GET | `/api/v1/auditoria?accion=&page=&size=` | `ROLE_ADMIN` (Parte 3) |
 
 ## Pruebas con cURL (Paso 10)
 
@@ -72,8 +75,8 @@ curl http://localhost:8080/api/v1/expedientes/101 -H "Authorization: Bearer <TOK
 # Prueba 4: IDOR -> 403 RFC 7807
 curl http://localhost:8080/api/v1/expedientes/101 -H "Authorization: Bearer <TOKEN_MARIA>"
 
-# Prueba 5: fuerza bruta -> 429 + Retry-After: 60
-for i in {1..12}; do
+# Prueba 5 / Reto A: fuerza bruta -> 5 x 401 y el 6.º intento 429 + Retry-After: 60
+for i in {1..6}; do
   curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8080/api/v1/auth/login \
     -H "Content-Type: application/json" \
     -d '{"username":"admin_root","password":"ClaveIncorrecta1"}'
@@ -112,7 +115,34 @@ Respuesta verificada de la Prueba 4:
 
 **Solución aplicada**: `PATCH /api/v1/expedientes/{id}/notas` con `@PreAuthorize("hasAuthority('ROLE_DOCTOR')")`, un DTO validado (`ActualizarNotasRequestDto`, de 10 a 4000 caracteres) y `ExpedienteService#actualizarNotasDefensivo`, que verifica que el solicitante sea el médico asignado y lanza `AccessDeniedSecurityException` o `ResourceNotFoundException` según corresponda.
 
-## Pendiente (Parte 3 – Reto Autónomo)
+## Parte 3 – Reto Autónomo
 
-- **Requerimiento A**: en `RateLimitingFilter`, obtener la IP del cliente (`X-Forwarded-For` → `getRemoteAddr()`), mantener un `ConcurrentHashMap<String, Bucket>` por IP y limitar el login a 5 intentos por minuto por IP (el 6.º debe recibir 429).
-- **Requerimiento B**: crear la entidad/repositorio de `AUDIT_LOGS` (la tabla ya existe en `schema.sql`) y un `SecurityAuditorService` que registre `IDOR_ATTEMPT_BLOCKED` (403) y `LOGIN_FAILED` (401) con usuario, IP, recurso y fecha.
+### Requerimiento A: Rate Limiting granular por IP
+
+- `ClientIpResolver` toma la **primera IP** de `X-Forwarded-For` (el cliente original cuando hay proxy inverso). Si la cabecera no existe o su valor no tiene formato de IP, usa `request.getRemoteAddr()`.
+- `RateLimitingFilter` mantiene un `ConcurrentHashMap<String, Bucket>` por IP (`computeIfAbsent`, seguro ante concurrencia):
+  - login: **5 intentos por minuto por IP**; el 6.º recibe **HTTP 429** con `Retry-After: 60` y cuerpo RFC 7807;
+  - expedientes: 30 peticiones por minuto por IP.
+- Bloquear una IP no afecta a las demás: cada cliente tiene su propio bucket.
+
+> **Nota de seguridad:** `X-Forwarded-For` lo puede falsificar el cliente. Solo se debe confiar en esa cabecera si la API está detrás de un proxy que la reescribe. Para ignorarla, configure `medivault.security.trust-forwarded-header: false`.
+
+### Requerimiento B: Auditoría de seguridad inmutable
+
+- **Entidad `AuditLog`**: está marcada con `@Immutable`, no tiene setters y su constructor trunca cada campo al tamaño de la columna.
+- **`AuditLogRepository`**: extiende `Repository` (no `JpaRepository`), así que solo expone inserción y consulta. No hay métodos de borrado ni de actualización.
+- **`SecurityAuditorService`** registra dos eventos:
+  - `IDOR_ATTEMPT_BLOCKED` (403): se dispara desde `GlobalSecurityExceptionHandler` cada vez que se lanza una `AccessDeniedSecurityException`. Guarda el usuario, la IP, el método y la ruta (que incluye el ID del expediente que se intentó vulnerar) y el motivo.
+  - `LOGIN_FAILED` (401): se dispara desde `AuthController` ante cada credencial inválida. Guarda el usuario que se intentó usar y la IP.
+- **Escritura desacoplada**: el registro es `@Async`, corre en un pool dedicado (`auditExecutor`) y usa una transacción `REQUIRES_NEW`. Así no se agrega latencia a la petición y el evento se guarda aunque la operación de negocio haga rollback. Si la escritura de auditoría falla, el error se registra en el log y la petición original no se ve afectada.
+- **Sin datos clínicos**: la bitácora nunca guarda diagnósticos ni notas, solo metadatos de seguridad. La fecha (`fecha_evento`) la asigna la base de datos.
+- **Consulta**: `GET /api/v1/auditoria`, restringida a `ROLE_ADMIN`. Se puede filtrar por `accion` y está paginada (máximo 100 registros por página).
+
+### Checklist del reto
+
+- [x] `RateLimitingFilter` mantiene buckets independientes por dirección IP del cliente.
+- [x] 6 solicitudes consecutivas a `/api/v1/auth/login` desde la misma IP: la sexta recibe HTTP 429.
+- [x] `AUDIT_LOGS` registra de forma automática e inmutable los incidentes IDOR y los fallos de login, con IP y timestamp.
+- [x] La auditoría es asíncrona y desacoplada, y no expone datos clínicos.
+
+Cada punto del checklist está cubierto por una prueba en `SecurityIntegrationTest` (10 pruebas en total).
