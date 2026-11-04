@@ -1,0 +1,37 @@
+server:
+  port: 8080
+  error:
+    include-message: never
+    include-binding-errors: never
+    include-stacktrace: never
+    include-exception: false
+
+spring:
+  application:
+    name: medivault-security-backend
+  main:
+    banner-mode: "off"
+  datasource:
+    url: jdbc:h2:mem:medivaultdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    database-platform: org.hibernate.dialect.H2Dialect
+    hibernate:
+      ddl-auto: none
+    show-sql: false
+    open-in-view: false
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+      data-locations: classpath:data.sql
+
+# Parametros de seguridad JWT
+medivault:
+  security:
+    jwt:
+      # Clave secreta HMAC-SHA256 (32+ chars)
+      secret: "v9y$B&E)H@McQfTjWnZr4u7x!A%D*G-KaPdSgUkXp2s5v8y/B?E(H+MbQeThWmYq"
+      expiration-ms: 3600000 # 1 hora
