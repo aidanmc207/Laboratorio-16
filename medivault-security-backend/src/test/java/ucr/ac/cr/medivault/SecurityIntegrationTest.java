@@ -13,6 +13,14 @@ import org.springframework.http.MediaType;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import ucr.ac.cr.medivault.business.SecurityAuditorService;
+import ucr.ac.cr.medivault.data.AuditLogRepository;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.LongSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -23,7 +31,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Reproduce las pruebas de seguridad del Paso 10 (cURL) con MockMvc.
+ * Reproduce las pruebas de seguridad del Paso 10 (cURL), la Parte 2 y
+ * el checklist del Reto Autonomo (Parte 3) con MockMvc.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -31,22 +40,54 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class SecurityIntegrationTest {
 
+    // Cada login de los tests usa una IP distinta para no agotar el bucket por IP
+    private static final AtomicInteger IP_SEQ = new AtomicInteger(1);
+
     @Autowired
     private MockMvc mvc;
 
     @Autowired
     private ObjectMapper mapper;
 
+    @Autowired
+    private AuditLogRepository auditRepo;
+
+    private static MockHttpServletRequestBuilder desdeIp(MockHttpServletRequestBuilder b, String ip) {
+        return b.with(req -> {
+            req.setRemoteAddr(ip);
+            return req;
+        });
+    }
+
+    private static MockHttpServletRequestBuilder loginRequest(String username, String password) {
+        return post("/api/v1/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"" + username + "\",\"password\":\"" + password + "\"}");
+    }
+
     private String login(String username) throws Exception {
-        MvcResult r = mvc.perform(post("/api/v1/auth/login")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"username\":\"" + username + "\",\"password\":\"Password123!\"}"))
+        String ip = "10.0.0." + IP_SEQ.getAndIncrement();
+        MvcResult r = mvc.perform(desdeIp(loginRequest(username, "Password123!"), ip))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.tokenType").value("Bearer"))
                 .andReturn();
         JsonNode body = mapper.readTree(r.getResponse().getContentAsString());
         return body.get("token").asText();
     }
+
+    /** La auditoria es asincrona: espera (maximo 5 s) a que aparezca el registro. */
+    private static long esperar(LongSupplier conteo, long esperado) throws InterruptedException {
+        long valor = conteo.getAsLong();
+        for (int i = 0; i < 50 && valor < esperado; i++) {
+            Thread.sleep(100);
+            valor = conteo.getAsLong();
+        }
+        return valor;
+    }
+
+    // ------------------------------------------------------------------
+    // Parte 1 - Paso 10
+    // ------------------------------------------------------------------
 
     @Test
     @Order(1)
@@ -76,15 +117,20 @@ class SecurityIntegrationTest {
 
     @Test
     @Order(3)
-    void prueba4_ataqueIdorBloqueadoConRfc7807() throws Exception {
+    void prueba4_ataqueIdorBloqueadoConRfc7807YAuditado() throws Exception {
         String tokenMaria = login("paciente_maria");
 
-        mvc.perform(get("/api/v1/expedientes/101")
+        mvc.perform(desdeIp(get("/api/v1/expedientes/101"), "198.51.100.23")
                         .header("Authorization", "Bearer " + tokenMaria))
                 .andExpect(status().isForbidden())
                 .andExpect(jsonPath("$.type").value("https://medivault.ucr.ac.cr/forbidden"))
                 .andExpect(jsonPath("$.title").value("Acceso Prohibido (IDOR / BOLA)"))
                 .andExpect(jsonPath("$.status").value(403));
+
+        // Parte 3 - Req. B: el intento queda registrado en AUDIT_LOGS
+        long registros = esperar(() -> auditRepo.countByAccionAndIpOrigen(
+                SecurityAuditorService.IDOR_ATTEMPT_BLOCKED, "198.51.100.23"), 1);
+        assertThat(registros).isEqualTo(1);
     }
 
     @Test
@@ -125,6 +171,10 @@ class SecurityIntegrationTest {
                 .andExpect(jsonPath("$.title").value("Recurso No Encontrado"));
     }
 
+    // ------------------------------------------------------------------
+    // Parte 2
+    // ------------------------------------------------------------------
+
     @Test
     @Order(6)
     void parte2_actualizacionDeNotasSegura() throws Exception {
@@ -157,23 +207,79 @@ class SecurityIntegrationTest {
                 .andExpect(status().isUnauthorized());
     }
 
+    // ------------------------------------------------------------------
+    // Parte 3 - Reto Autonomo
+    // ------------------------------------------------------------------
+
     @Test
     @Order(7)
-    void prueba5_fuerzaBrutaBloqueadaConRateLimiting() throws Exception {
-        boolean bloqueado = false;
-        for (int i = 0; i < 12; i++) {
-            MvcResult r = mvc.perform(post("/api/v1/auth/login")
-                            .contentType(MediaType.APPLICATION_JSON)
-                            .content("{\"username\":\"admin_root\",\"password\":\"ClaveIncorrecta1\"}"))
+    void parte3A_sextoIntentoDesdeLaMismaIpRecibe429() throws Exception {
+        String ip = "203.0.113.7";
+        List<Integer> codigos = new ArrayList<>();
+
+        for (int i = 0; i < 6; i++) {
+            MvcResult r = mvc.perform(desdeIp(loginRequest("admin_root", "ClaveIncorrecta1"), ip))
                     .andReturn();
-            int code = r.getResponse().getStatus();
-            if (code == 429) {
+            codigos.add(r.getResponse().getStatus());
+            if (i == 5) {
                 assertThat(r.getResponse().getHeader("Retry-After")).isEqualTo("60");
-                bloqueado = true;
-                break;
             }
-            assertThat(code).isEqualTo(401);
         }
-        assertThat(bloqueado).isTrue();
+
+        assertThat(codigos).containsExactly(401, 401, 401, 401, 401, 429);
+
+        // Parte 3 - Req. B: los 5 fallos de login quedaron auditados con su IP
+        long registros = esperar(() -> auditRepo.countByAccionAndIpOrigen(
+                SecurityAuditorService.LOGIN_FAILED, ip), 5);
+        assertThat(registros).isEqualTo(5);
+    }
+
+    @Test
+    @Order(8)
+    void parte3A_otraIpTieneSuPropioBucket() throws Exception {
+        // La IP anterior esta bloqueada, pero otra IP sigue pudiendo autenticarse
+        mvc.perform(desdeIp(loginRequest("admin_root", "Password123!"), "203.0.113.8"))
+                .andExpect(status().isOk());
+
+        mvc.perform(desdeIp(loginRequest("admin_root", "Password123!"), "203.0.113.7"))
+                .andExpect(status().isTooManyRequests());
+    }
+
+    @Test
+    @Order(9)
+    void parte3A_seRespetaXForwardedFor() throws Exception {
+        String proxy = "172.16.0.1";
+        // Seis peticiones a traves del mismo proxy pero de clientes distintos: ninguna se bloquea
+        for (int i = 1; i <= 6; i++) {
+            mvc.perform(desdeIp(loginRequest("admin_root", "ClaveIncorrecta1"), proxy)
+                            .header("X-Forwarded-For", "192.0.2." + i + ", " + proxy))
+                    .andExpect(status().isUnauthorized());
+        }
+
+        // Fallos de login atribuidos a la IP real del cliente, no a la del proxy
+        long registros = esperar(() -> auditRepo.countByAccionAndIpOrigen(
+                SecurityAuditorService.LOGIN_FAILED, "192.0.2.3"), 1);
+        assertThat(registros).isEqualTo(1);
+    }
+
+    @Test
+    @Order(10)
+    void parte3B_consultaDeAuditoriaSoloAdminYSinDatosClinicos() throws Exception {
+        String tokenAdmin = login("admin_root");
+        String tokenCarlos = login("paciente_carlos");
+
+        mvc.perform(get("/api/v1/auditoria")
+                        .param("accion", SecurityAuditorService.IDOR_ATTEMPT_BLOCKED)
+                        .header("Authorization", "Bearer " + tokenAdmin))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].accion").value("IDOR_ATTEMPT_BLOCKED"))
+                .andExpect(jsonPath("$[0].codigoEstado").value(403))
+                .andExpect(jsonPath("$[0].fechaEvento").exists())
+                .andExpect(jsonPath("$[0].notasClinicas").doesNotExist())
+                .andExpect(jsonPath("$[0].diagnosticoPrincipal").doesNotExist());
+
+        mvc.perform(get("/api/v1/auditoria")
+                        .header("Authorization", "Bearer " + tokenCarlos))
+                .andExpect(status().isForbidden());
     }
 }
